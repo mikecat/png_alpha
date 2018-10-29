@@ -1,9 +1,16 @@
+#if defined(_WIN32) && !defined(FORCE_NOT_WIN)
+#define WIN_MODE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <errno.h>
+#ifdef WIN_MODE
+#include <windows.h>
+#include <inttypes.h>
+#endif
 #include <png.h>
 #include <zlib.h>
 
@@ -77,6 +84,75 @@ char* get_output_file_name(const char* input_name, const char* output_name) {
 	}
 }
 
+void read_file(png_structp png_ptr, png_bytep data, size_t length) {
+#ifdef WIN_MODE
+	HANDLE hFile = *(HANDLE*)png_get_io_ptr(png_ptr);
+	size_t lengthLeft = length;
+	while (lengthLeft > 0) {
+		DWORD lengthToRead = UINT32_C(0xffffffff);
+		DWORD lengthRead = 0;
+		if (lengthLeft < lengthToRead) lengthToRead = lengthLeft;
+		if (!ReadFile(hFile, data, lengthToRead, &lengthRead, NULL) ||
+		lengthToRead != lengthRead) {
+			png_error(png_ptr, "file read error");
+		}
+		lengthLeft -= lengthRead;
+		data += lengthRead;
+	}
+#else
+	FILE* fp = png_get_io_ptr(png_ptr);
+	if (fp == NULL) {
+		png_error(png_ptr, "fp to read is NULL");
+	}
+	if (fread(data, length, 1, fp) != 1) {
+		png_error(png_ptr, "file read error");
+	}
+#endif
+}
+
+void write_file(png_structp png_ptr, png_bytep data, size_t length) {
+#ifdef WIN_MODE
+	HANDLE hFile = *(HANDLE*)png_get_io_ptr(png_ptr);
+	size_t lengthLeft = length;
+	while (lengthLeft > 0) {
+		DWORD lengthToWrite = UINT32_C(0xffffffff);
+		DWORD lengthWritten = 0;
+		if (lengthLeft < lengthToWrite) lengthToWrite = lengthLeft;
+		if (!WriteFile(hFile, data, lengthToWrite, &lengthWritten, NULL) ||
+		lengthToWrite != lengthWritten) {
+			png_error(png_ptr, "file write error");
+		}
+		lengthLeft -= lengthWritten;
+		data += lengthWritten;
+	}
+#else
+	FILE* fp = png_get_io_ptr(png_ptr);
+	if (fp == NULL) {
+		png_error(png_ptr, "fp to write is NULL");
+	}
+	if (fwrite(data, length, 1, fp) != 1) {
+		png_error(png_ptr, "file write error");
+	}
+#endif
+}
+
+void flush_file(png_structp png_ptr) {
+#ifdef WIN_MODE
+	HANDLE hFile = *(HANDLE*)png_get_io_ptr(png_ptr);
+	if (!FlushFileBuffers(hFile)) {
+		png_error(png_ptr, "file flush error");
+	}
+#else
+	FILE* fp = png_get_io_ptr(png_ptr);
+	if (fp == NULL) {
+		png_error(png_ptr, "fp to flush is NULL");
+	}
+	if (fflush(fp) != 0) {
+		png_error(png_ptr, "file flush error");
+	}
+#endif
+}
+
 int main(int argc, char* argv[]) {
 	static png_byte chunks_to_ignore[] = {
 		99, 72, 82, 77, 0, /* cHRM */
@@ -93,8 +169,13 @@ int main(int argc, char* argv[]) {
 		115, 67, 65, 76, 0, /* sCAL */
 	};
 	char* output_name;
+#ifdef WIN_MODE
+	HANDLE hFileIn;
+	HANDLE hFileOut;
+#else
 	FILE* fpin;
 	FILE* fpout;
+#endif
 	png_structp png_in = NULL;
 	png_infop info_in = NULL, end_info_in = NULL;
 	png_structp png_out = NULL;
@@ -146,8 +227,16 @@ int main(int argc, char* argv[]) {
 		return 1;
 	}
 
+#ifdef WIN_MODE
+#define CLOSE_FPIN CloseHandle(hFileIn)
+	hFileIn = CreateFileA(argv[1], GENERIC_READ, 0, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFileIn == INVALID_HANDLE_VALUE) {
+#else
+#define CLOSE_FPIN fclose(fpin)
 	fpin = fopen(argv[1], "rb");
 	if (fpin == NULL) {
+#endif
 		fprintf(stderr, "failed to open input file %s\n", argv[1]);
 		free(output_name);
 		return 1;
@@ -156,7 +245,7 @@ int main(int argc, char* argv[]) {
 	png_in = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
 	if (png_in == NULL) {
 		fprintf(stderr, "failed to create png_struct for input\n");
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
@@ -164,7 +253,7 @@ int main(int argc, char* argv[]) {
 	if (info_in == NULL) {
 		fprintf(stderr, "failed to create png_info for input\n");
 		png_destroy_read_struct(&png_in, NULL, NULL);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
@@ -172,13 +261,13 @@ int main(int argc, char* argv[]) {
 	if (end_info_in == NULL) {
 		fprintf(stderr, "failed to create 2nd png_info for input\n");
 		png_destroy_read_struct(&png_in, &info_in, NULL);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
 	if (setjmp(png_jmpbuf(png_in))) {
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
@@ -187,7 +276,7 @@ int main(int argc, char* argv[]) {
 	if (png_out == NULL) {
 		fprintf(stderr, "failed to create png_struct for output\n");
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
@@ -196,19 +285,23 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "failed to create png_info for output\n");
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 		png_destroy_write_struct(&png_out, NULL);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
 	if (setjmp(png_jmpbuf(png_out))) {
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 		png_destroy_write_struct(&png_out, &info_out);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
 
-	png_init_io(png_in, fpin);
+#ifdef WIN_MODE
+	png_set_read_fn(png_in, &hFileIn, read_file);
+#else
+	png_set_read_fn(png_in, fpin, read_file);
+#endif
 	png_set_keep_unknown_chunks(png_in, PNG_HANDLE_CHUNK_ALWAYS, NULL, 0);
 	png_set_keep_unknown_chunks(png_in, PNG_HANDLE_CHUNK_ALWAYS,
 		chunks_to_ignore, sizeof(chunks_to_ignore) / 5);
@@ -251,18 +344,30 @@ int main(int argc, char* argv[]) {
 	row = malloc(row_size);
 	if (row == NULL) png_error(png_in, "allocating row failed");
 
+#ifdef WIN_MODE
+#define CLOSE_FPOUT CloseHandle(hFileOut)
+	hFileOut = CreateFileA(output_name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (hFileOut == INVALID_HANDLE_VALUE) {
+#else
+#define CLOSE_FPOUT fclose(fpout)
 	fpout = fopen(output_name, "wb");
 	if (fpout == NULL) {
+#endif
 		fprintf(stderr, "failed to open output file %s\n", output_name);
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 		png_destroy_write_struct(&png_out, &info_out);
-		fclose(fpin);
+		CLOSE_FPIN;
 		free(output_name);
 		return 1;
 	}
 	free(output_name);
 
-	png_init_io(png_out, fpout);
+#ifdef WIN_MODE
+	png_set_write_fn(png_out, &hFileOut, write_file, flush_file);
+#else
+	png_set_write_fn(png_out, fpout, write_file, flush_file);
+#endif
 	png_set_keep_unknown_chunks(png_out, PNG_HANDLE_CHUNK_ALWAYS, NULL, 0);
 	png_set_keep_unknown_chunks(png_out, PNG_HANDLE_CHUNK_ALWAYS,
 		chunks_to_ignore, sizeof(chunks_to_ignore) / 5);
@@ -313,7 +418,7 @@ int main(int argc, char* argv[]) {
 
 	png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 	png_destroy_write_struct(&png_out, &info_out);
-	fclose(fpin);
-	fclose(fpout);
+	CLOSE_FPIN;
+	CLOSE_FPOUT;
 	return 0;
 }
