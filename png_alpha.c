@@ -84,6 +84,143 @@ char* get_output_file_name(const char* input_name, const char* output_name) {
 	}
 }
 
+#ifdef WIN_MODE
+struct unicode_functions {
+	HMODULE kernel32;
+	HMODULE shell32;
+	HMODULE user32;
+
+	LPWSTR WINAPI (*GetCommandLine)(void);
+	LPWSTR* WINAPI (*CommandLineToArgv)(LPCWSTR, int*);
+	DWORD WINAPI (*GetFileAttributes)(LPCWSTR);
+	HANDLE WINAPI (*CreateFile)(LPCWSTR, DWORD, DWORD,
+		LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+	int WINAPI (*lstrlen)(LPCWSTR);
+	LPWSTR WINAPI (*lstrcpy)(LPWSTR, LPCWSTR);
+	LPWSTR WINAPI (*lstrcat)(LPWSTR, LPCWSTR);
+	int WINAPI (*wsprintf)(LPWSTR, LPCWSTR, ...);
+};
+
+/* 1: success 0: failed */
+int load_functions(struct unicode_functions* funcs) {
+	if ((funcs->kernel32 = LoadLibraryA("kernel32.dll")) == NULL) {
+		funcs->shell32 = funcs->user32 = NULL;
+		return 0;
+	}
+	if ((funcs->shell32 = LoadLibraryA("shell32.dll")) == NULL) {
+		FreeLibrary(funcs->kernel32);
+		funcs->kernel32 = funcs->user32 = NULL;
+		return 0;
+	}
+	if ((funcs->user32 = LoadLibraryA("user32.dll")) == NULL) {
+		FreeLibrary(funcs->kernel32);
+		FreeLibrary(funcs->shell32);
+		funcs->kernel32 = funcs->shell32 = NULL;
+		return 0;
+	}
+	if ((funcs->GetCommandLine = (void*)GetProcAddress(funcs->kernel32, "GetCommandLineW")) &&
+	(funcs->CommandLineToArgv = (void*)GetProcAddress(funcs->shell32, "CommandLineToArgvW")) &&
+	(funcs->GetFileAttributes = (void*)GetProcAddress(funcs->kernel32, "GetFileAttributesW")) &&
+	(funcs->CreateFile = (void*)GetProcAddress(funcs->kernel32, "CreateFileW")) &&
+	(funcs->lstrlen = (void*)GetProcAddress(funcs->kernel32, "lstrlenW")) &&
+	(funcs->lstrcpy = (void*)GetProcAddress(funcs->kernel32, "lstrcpyW")) &&
+	(funcs->lstrcat = (void*)GetProcAddress(funcs->kernel32, "lstrcatW")) &&
+	(funcs->wsprintf = (void*)GetProcAddress(funcs->user32, "wsprintfW"))) {
+		return 1;
+	} else {
+		FreeLibrary(funcs->kernel32);
+		FreeLibrary(funcs->shell32);
+		FreeLibrary(funcs->user32);
+		funcs->kernel32 = funcs->shell32 = funcs->user32 = NULL;
+		return 0;
+	}
+}
+
+void unload_functions(struct unicode_functions* funcs) {
+	FreeLibrary(funcs->kernel32);
+	FreeLibrary(funcs->shell32);
+}
+
+/* 1: exists 0: doesn't exist -1: error */
+int file_exists_w(const struct unicode_functions* funcs, LPCWSTR path) {
+	DWORD attr = funcs->GetFileAttributes(path);
+	if (attr == (DWORD)(-1)) {
+		DWORD err = GetLastError();
+		if (err == ERROR_FILE_NOT_FOUND) return 0;
+		return -1;
+	} else {
+		return 1;
+	}
+}
+
+LPWSTR get_output_file_name_w(const struct unicode_functions* funcs,
+LPCWSTR input_name, LPCWSTR output_name) {
+	if (output_name != NULL) {
+		LPWSTR ret = malloc(sizeof(*output_name) * (funcs->lstrlen(output_name) + 1));
+		if (ret == NULL) return NULL;
+		funcs->lstrcpy(ret, output_name);
+		return ret;
+	} else {
+		LPCWSTR suffix = L"-alpha";
+		size_t ret_max = funcs->lstrlen(input_name) + funcs->lstrlen(suffix) + 32;
+		LPWSTR ret = malloc(sizeof(*ret) * ret_max);
+		LPWSTR input_name_copy = malloc(sizeof(*input_name) * (funcs->lstrlen(input_name) + 2));
+		LPWSTR ext, ext_search;
+		int fexists;
+		if (ret == NULL || input_name_copy == NULL) {
+			free(ret);
+			free(input_name_copy);
+			return NULL;
+		}
+		funcs->lstrcpy(input_name_copy, input_name);
+		for (ext = NULL, ext_search = input_name_copy; *ext_search != L'\0'; ext_search++) {
+			if (*ext_search == L'.') ext = ext_search;
+		}
+		if (ext == NULL) {
+			ext = input_name_copy + funcs->lstrlen(input_name_copy);
+		} else {
+			memmove(ext + 1, ext, sizeof(*ext) * (funcs->lstrlen(ext) + 1));
+			*ext = L'\0';
+			ext++;
+		}
+		funcs->lstrcpy(ret, input_name_copy);
+		funcs->lstrcat(ret, suffix);
+		funcs->lstrcat(ret, ext);
+		fexists = file_exists_w(funcs, ret);
+		if (fexists == 0) {
+			free(input_name_copy);
+			return ret;
+		} else if (fexists < 0) {
+			free(ret);
+			free(input_name_copy);
+			return NULL;
+		} else {
+			unsigned int no = 2;
+			LPWSTR ret_suffix;
+			funcs->lstrcpy(ret, input_name_copy);
+			funcs->lstrcat(ret, suffix);
+			funcs->lstrcat(ret, L"-");
+			ret_suffix = ret + funcs->lstrlen(ret);
+			for (;;) {
+				funcs->wsprintf(ret_suffix, L"%u", no);
+				funcs->lstrcat(ret_suffix, ext);
+				fexists = file_exists_w(funcs, ret);
+				if (fexists == 0) {
+					free(input_name_copy);
+					return ret;
+				} else if (fexists < 0 || no == UINT_MAX) {
+					free(ret);
+					free(input_name_copy);
+					return NULL;
+				} else {
+					no++;
+				}
+			}
+		}
+	}
+}
+#endif
+
 void read_file(png_structp png_ptr, png_bytep data, size_t length) {
 #ifdef WIN_MODE
 	HANDLE hFile = *(HANDLE*)png_get_io_ptr(png_ptr);
@@ -168,10 +305,15 @@ int main(int argc, char* argv[]) {
 		112, 72, 89, 115, 0, /* pHYs */
 		115, 67, 65, 76, 0, /* sCAL */
 	};
-	char* output_name;
+	char* output_name = NULL;
 #ifdef WIN_MODE
 	HANDLE hFileIn;
 	HANDLE hFileOut;
+	struct unicode_functions funcs;
+	int unicode_mode;
+	LPWSTR* argv_w = NULL;
+	int argc_w = 0;
+	LPWSTR output_name_w;
 #else
 	FILE* fpin;
 	FILE* fpout;
@@ -221,16 +363,50 @@ int main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	output_name = get_output_file_name(argv[1], argc >= 3 ? argv[2] : NULL);
-	if (output_name == NULL) {
-		fprintf(stderr, "failed to decide output file name\n");
-		return 1;
+#ifdef WIN_MODE
+	unicode_mode = load_functions(&funcs);
+	if (unicode_mode) {
+		argv_w = funcs.CommandLineToArgv(funcs.GetCommandLine(), &argc_w);
+		if (argv_w == NULL) {
+			fprintf(stderr, "command line read failed\n");
+			unload_functions(&funcs);
+			return 1;
+		}
 	}
+#define UNLOAD_FUNCTIONS unload_functions(&funcs);
+#else
+#define UNLOAD_FUNCTIONS
+#endif
+
+#ifdef WIN_MODE
+	if (unicode_mode) {
+		output_name_w = get_output_file_name_w(&funcs, argv_w[1], argc_w >= 3 ? argv_w[2] : NULL);
+		if (output_name_w == NULL) {
+			fprintf(stderr, "failed to decide output file name\n");
+			UNLOAD_FUNCTIONS
+			return 1;
+		}
+	} else {
+#endif
+		output_name = get_output_file_name(argv[1], argc >= 3 ? argv[2] : NULL);
+		if (output_name == NULL) {
+			fprintf(stderr, "failed to decide output file name\n");
+			UNLOAD_FUNCTIONS
+			return 1;
+		}
+#ifdef WIN_MODE
+	}
+#endif
 
 #ifdef WIN_MODE
 #define CLOSE_FPIN CloseHandle(hFileIn)
-	hFileIn = CreateFileA(argv[1], GENERIC_READ, 0, NULL, OPEN_EXISTING,
-		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (unicode_mode) {
+		hFileIn = funcs.CreateFile(argv_w[1], GENERIC_READ, 0, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	} else {
+		hFileIn = CreateFileA(argv[1], GENERIC_READ, 0, NULL, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	}
 	if (hFileIn == INVALID_HANDLE_VALUE) {
 #else
 #define CLOSE_FPIN fclose(fpin)
@@ -239,6 +415,7 @@ int main(int argc, char* argv[]) {
 #endif
 		fprintf(stderr, "failed to open input file %s\n", argv[1]);
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 
@@ -247,6 +424,7 @@ int main(int argc, char* argv[]) {
 		fprintf(stderr, "failed to create png_struct for input\n");
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	info_in = png_create_info_struct(png_in);
@@ -255,6 +433,7 @@ int main(int argc, char* argv[]) {
 		png_destroy_read_struct(&png_in, NULL, NULL);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	end_info_in = png_create_info_struct(png_in);
@@ -263,12 +442,14 @@ int main(int argc, char* argv[]) {
 		png_destroy_read_struct(&png_in, &info_in, NULL);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	if (setjmp(png_jmpbuf(png_in))) {
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 
@@ -278,6 +459,7 @@ int main(int argc, char* argv[]) {
 		png_destroy_read_struct(&png_in, &info_in, &end_info_in);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	info_out = png_create_info_struct(png_out);
@@ -287,6 +469,7 @@ int main(int argc, char* argv[]) {
 		png_destroy_write_struct(&png_out, NULL);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	if (setjmp(png_jmpbuf(png_out))) {
@@ -294,6 +477,7 @@ int main(int argc, char* argv[]) {
 		png_destroy_write_struct(&png_out, &info_out);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 
@@ -346,8 +530,13 @@ int main(int argc, char* argv[]) {
 
 #ifdef WIN_MODE
 #define CLOSE_FPOUT CloseHandle(hFileOut)
-	hFileOut = CreateFileA(output_name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
-		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (unicode_mode) {
+		hFileOut = funcs.CreateFile(output_name_w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	} else {
+		hFileOut = CreateFileA(output_name, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, NULL);
+	}
 	if (hFileOut == INVALID_HANDLE_VALUE) {
 #else
 #define CLOSE_FPOUT fclose(fpout)
@@ -359,6 +548,7 @@ int main(int argc, char* argv[]) {
 		png_destroy_write_struct(&png_out, &info_out);
 		CLOSE_FPIN;
 		free(output_name);
+		UNLOAD_FUNCTIONS
 		return 1;
 	}
 	free(output_name);
@@ -420,5 +610,6 @@ int main(int argc, char* argv[]) {
 	png_destroy_write_struct(&png_out, &info_out);
 	CLOSE_FPIN;
 	CLOSE_FPOUT;
+	UNLOAD_FUNCTIONS
 	return 0;
 }
