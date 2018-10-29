@@ -137,8 +137,10 @@ int load_functions(struct unicode_functions* funcs) {
 }
 
 void unload_functions(struct unicode_functions* funcs) {
-	FreeLibrary(funcs->kernel32);
-	FreeLibrary(funcs->shell32);
+	if (funcs->kernel32 != NULL) FreeLibrary(funcs->kernel32);
+	if (funcs->shell32 != NULL) FreeLibrary(funcs->shell32);
+	if (funcs->user32 != NULL) FreeLibrary(funcs->user32);
+	funcs->kernel32 = funcs->shell32 = funcs->user32 = NULL;
 }
 
 /* 1: exists 0: doesn't exist -1: error */
